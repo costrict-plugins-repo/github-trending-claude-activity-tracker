@@ -1,0 +1,420 @@
+"""
+SQLite database layer for Claude Code activity tracker.
+DB path: ~/.claude-activity/activity.db
+"""
+
+import json
+import sqlite3
+import time
+from pathlib import Path
+
+DEFAULT_DB_PATH = Path.home() / ".claude-activity" / "activity.db"
+
+
+def _connect(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def init_db(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
+    """Create tables if they don't exist. Returns an open connection."""
+    conn = _connect(db_path)
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            id               TEXT    PRIMARY KEY,
+            started_at       INTEGER NOT NULL,
+            ended_at         INTEGER,
+            project          TEXT    NOT NULL DEFAULT '',
+            total_tools      INTEGER NOT NULL DEFAULT 0,
+            total_requests   INTEGER NOT NULL DEFAULT 0,
+            git_branch       TEXT    NOT NULL DEFAULT ''
+        );
+
+        CREATE TABLE IF NOT EXISTS events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id  TEXT    NOT NULL REFERENCES sessions(id),
+            ts          INTEGER NOT NULL,
+            type        TEXT    NOT NULL,
+            tool_name   TEXT    NOT NULL DEFAULT '',
+            file_path   TEXT    NOT NULL DEFAULT '',
+            project     TEXT    NOT NULL DEFAULT ''
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
+        CREATE INDEX IF NOT EXISTS idx_events_ts      ON events(ts);
+        CREATE INDEX IF NOT EXISTS idx_events_type    ON events(type);
+        CREATE INDEX IF NOT EXISTS idx_events_file    ON events(file_path);
+    """)
+    conn.commit()
+
+    # Migration: add git_branch column to existing databases that lack it.
+    existing = {
+        row[1]
+        for row in conn.execute("PRAGMA table_info(sessions)").fetchall()
+    }
+    if "git_branch" not in existing:
+        conn.execute("ALTER TABLE sessions ADD COLUMN git_branch TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+
+    return conn
+
+
+def start_session(session_id: str, project: str, ts: int | None = None,
+                  git_branch: str = "",
+                  db_path: str | Path = DEFAULT_DB_PATH) -> None:
+    """Insert a new session row."""
+    ts = ts or int(time.time())
+    conn = init_db(db_path)
+    with conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, started_at, project, git_branch) VALUES (?, ?, ?, ?)",
+            (session_id, ts, project, git_branch),
+        )
+
+
+def end_session(session_id: str, ts: int | None = None,
+                db_path: str | Path = DEFAULT_DB_PATH) -> None:
+    """Set ended_at on a session."""
+    ts = ts or int(time.time())
+    conn = init_db(db_path)
+    with conn:
+        conn.execute(
+            "UPDATE sessions SET ended_at = ? WHERE id = ?",
+            (ts, session_id),
+        )
+
+
+def log_event(
+    session_id: str,
+    ts: int | None = None,
+    event_type: str = "",
+    tool_name: str = "",
+    file_path: str = "",
+    project: str = "",
+    db_path: str | Path = DEFAULT_DB_PATH,
+) -> None:
+    """Insert an event and increment the appropriate session counter."""
+    ts = ts or int(time.time())
+    conn = init_db(db_path)
+    with conn:
+        conn.execute(
+            """INSERT INTO events (session_id, ts, type, tool_name, file_path, project)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (session_id, ts, event_type, tool_name, file_path, project),
+        )
+        # Increment tool count for any tool event; request count for user turns.
+        if event_type in ("PreToolUse", "PostToolUse"):
+            conn.execute(
+                "UPDATE sessions SET total_tools = total_tools + 1 WHERE id = ?",
+                (session_id,),
+            )
+        elif event_type == "UserTurn":
+            conn.execute(
+                "UPDATE sessions SET total_requests = total_requests + 1 WHERE id = ?",
+                (session_id,),
+            )
+        # Ensure the session row exists (belt-and-suspenders for hook ordering issues).
+        conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, started_at, project) VALUES (?, ?, ?)",
+            (session_id, ts, project),
+        )
+
+
+def get_stats(days: int = 1, db_path: str | Path = DEFAULT_DB_PATH) -> dict:
+    """
+    Return aggregate stats for the last `days` days.
+
+    Keys:
+        total_sessions, total_tools, total_requests,
+        top_files     [{file, count}, ...],
+        top_tools     [{tool, count}, ...],
+        active_time_minutes
+    """
+    since = int(time.time()) - days * 86_400
+    conn = init_db(db_path)
+
+    row = conn.execute(
+        """SELECT
+               COUNT(DISTINCT id)            AS total_sessions,
+               SUM(total_tools)              AS total_tools,
+               SUM(total_requests)           AS total_requests,
+               SUM(COALESCE(ended_at, strftime('%s','now')) - started_at) AS raw_seconds
+           FROM sessions
+           WHERE started_at >= ?""",
+        (since,),
+    ).fetchone()
+
+    total_sessions = row["total_sessions"] or 0
+    total_tools = row["total_tools"] or 0
+    total_requests = row["total_requests"] or 0
+    active_time_minutes = round((row["raw_seconds"] or 0) / 60, 1)
+
+    top_files = [
+        {"file": r["file_path"], "count": r["cnt"]}
+        for r in conn.execute(
+            """SELECT file_path, COUNT(*) AS cnt
+               FROM events
+               WHERE ts >= ? AND file_path != ''
+               GROUP BY file_path
+               ORDER BY cnt DESC
+               LIMIT 10""",
+            (since,),
+        ).fetchall()
+    ]
+
+    top_tools = [
+        {"tool": r["tool_name"], "count": r["cnt"]}
+        for r in conn.execute(
+            """SELECT tool_name, COUNT(*) AS cnt
+               FROM events
+               WHERE ts >= ? AND tool_name != ''
+               GROUP BY tool_name
+               ORDER BY cnt DESC
+               LIMIT 10""",
+            (since,),
+        ).fetchall()
+    ]
+
+    return {
+        "total_sessions": total_sessions,
+        "total_tools": total_tools,
+        "total_requests": total_requests,
+        "top_files": top_files,
+        "top_tools": top_tools,
+        "active_time_minutes": active_time_minutes,
+    }
+
+
+def get_current_session(session_id: str,
+                        db_path: str | Path = DEFAULT_DB_PATH) -> dict | None:
+    """Return a dict with session info, or None if not found."""
+    conn = init_db(db_path)
+    row = conn.execute(
+        "SELECT * FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    if row is None:
+        return None
+
+    now = int(time.time())
+    ended_at = row["ended_at"] or now
+    duration_minutes = round((ended_at - row["started_at"]) / 60, 1)
+
+    # Files touched this session
+    files = [
+        r["file_path"]
+        for r in conn.execute(
+            """SELECT DISTINCT file_path FROM events
+               WHERE session_id = ? AND file_path != ''
+               ORDER BY ts DESC""",
+            (session_id,),
+        ).fetchall()
+    ]
+
+    return {
+        "id": row["id"],
+        "project": row["project"],
+        "started_at": row["started_at"],
+        "ended_at": row["ended_at"],
+        "duration_minutes": duration_minutes,
+        "total_tools": row["total_tools"],
+        "total_requests": row["total_requests"],
+        "files_touched": files,
+    }
+
+
+def get_patterns(days: int = 7, db_path: str | Path = DEFAULT_DB_PATH) -> dict:
+    """
+    Return usage patterns: hour-of-day, day-of-week, and task-type inference.
+    """
+    since = int(time.time()) - days * 86_400
+    conn = init_db(db_path)
+
+    hour_rows = conn.execute(
+        """SELECT CAST(strftime('%H', ts, 'unixepoch', 'localtime') AS INTEGER) AS hour,
+                  COUNT(*) AS cnt
+           FROM events WHERE ts >= ?
+           GROUP BY hour ORDER BY hour""",
+        (since,),
+    ).fetchall()
+
+    dow_rows = conn.execute(
+        """SELECT strftime('%w', ts, 'unixepoch', 'localtime') AS dow,
+                  COUNT(*) AS cnt
+           FROM events WHERE ts >= ?
+           GROUP BY dow ORDER BY dow""",
+        (since,),
+    ).fetchall()
+
+    tool_rows = conn.execute(
+        """SELECT tool_name, COUNT(*) AS cnt
+           FROM events WHERE ts >= ? AND tool_name != ''
+           GROUP BY tool_name""",
+        (since,),
+    ).fetchall()
+
+    tool_counts = {r["tool_name"]: r["cnt"] for r in tool_rows}
+    read  = tool_counts.get("Read", 0)
+    edit  = tool_counts.get("Edit", 0) + tool_counts.get("Write", 0)
+    bash  = tool_counts.get("Bash", 0)
+    web   = tool_counts.get("WebFetch", 0) + tool_counts.get("WebSearch", 0)
+    total = max(sum(tool_counts.values()), 1)
+
+    task_types = []
+    if (read + edit) / total > 0.5:
+        task_types.append("Code editing / refactoring")
+    if bash / total > 0.2:
+        task_types.append("Scripting / DevOps")
+    if web / total > 0.2:
+        task_types.append("Research / documentation")
+    if not task_types:
+        task_types.append("General AI assistance")
+
+    _DOW_NAMES = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    return {
+        "by_hour": [{"hour": r["hour"], "count": r["cnt"]} for r in hour_rows],
+        "by_dow":  [{"day": _DOW_NAMES[int(r["dow"])], "count": r["cnt"]} for r in dow_rows],
+        "task_types": task_types,
+        "tool_counts": tool_counts,
+    }
+
+
+def get_recent_files(limit: int = 10,
+                     db_path: str | Path = DEFAULT_DB_PATH) -> list[dict]:
+    """Return recently edited files with edit counts, most recent first."""
+    conn = init_db(db_path)
+    rows = conn.execute(
+        """SELECT file_path, COUNT(*) AS edit_count, MAX(ts) AS last_edited
+           FROM events
+           WHERE file_path != ''
+           GROUP BY file_path
+           ORDER BY last_edited DESC
+           LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    return [
+        {"file": r["file_path"], "edit_count": r["edit_count"], "last_edited": r["last_edited"]}
+        for r in rows
+    ]
+
+
+def get_daily_breakdown(days: int = 7,
+                        db_path: str | Path = DEFAULT_DB_PATH) -> list[dict]:
+    """
+    Return per-day stats for the last `days` days.
+
+    Each item: {date, sessions, tools, requests, active_minutes}
+    Date format: YYYY-MM-DD (local time).
+    """
+    since = int(time.time()) - days * 86_400
+    conn = init_db(db_path)
+
+    rows = conn.execute(
+        """SELECT
+               date(started_at, 'unixepoch', 'localtime') AS day,
+               COUNT(*)                                    AS sessions,
+               SUM(total_tools)                            AS tools,
+               SUM(total_requests)                         AS requests,
+               SUM(COALESCE(ended_at, strftime('%s','now')) - started_at) AS raw_seconds
+           FROM sessions
+           WHERE started_at >= ?
+           GROUP BY day
+           ORDER BY day""",
+        (since,),
+    ).fetchall()
+
+    return [
+        {
+            "date": r["day"],
+            "sessions": r["sessions"] or 0,
+            "tools": r["tools"] or 0,
+            "requests": r["requests"] or 0,
+            "active_minutes": round((r["raw_seconds"] or 0) / 60, 1),
+        }
+        for r in rows
+    ]
+
+
+def get_vscode_correlation(days: int = 7,
+                           db_path: str | Path = DEFAULT_DB_PATH) -> dict:
+    """
+    Cross-reference Claude projects with VSCode recently-opened workspaces.
+
+    Returns:
+        {
+            vscode_installed: bool,
+            vscode_projects: [str],   # all recent VSCode paths
+            shared_projects: [str],   # paths open in both Claude and VSCode
+        }
+    """
+    # --- Collect VSCode recent paths ---
+    vscode_paths: list[Path] = []
+    candidates = [
+        Path.home() / ".config" / "Code" / "User" / "globalStorage" / "storage.json",
+        Path.home() / ".config" / "VSCodium" / "User" / "globalStorage" / "storage.json",
+        Path.home() / ".vscode" / "storage.json",
+    ]
+    storage_file: Path | None = None
+    for c in candidates:
+        if c.exists():
+            storage_file = c
+            break
+
+    vscode_installed = storage_file is not None
+    vscode_projects: list[str] = []
+
+    if storage_file:
+        try:
+            data = json.loads(storage_file.read_text(encoding="utf-8", errors="replace"))
+            # VS Code stores recent paths under several possible keys.
+            recent: dict = data.get("history.recentlyOpenedPathsList", {})
+            if not recent:
+                # Older builds keep it at top level as a list-of-dicts.
+                recent = data.get("openedPathsList", {})
+            entries = (
+                recent.get("entries", [])
+                or recent.get("workspaces3", [])
+                or recent.get("workspaces", [])
+                or (recent if isinstance(recent, list) else [])
+            )
+            for entry in entries:
+                raw = ""
+                if isinstance(entry, str):
+                    raw = entry
+                elif isinstance(entry, dict):
+                    raw = entry.get("folderUri", "") or entry.get("workspace", {}).get("configPath", "")
+                # Strip file:// URI prefix if present.
+                if raw.startswith("file://"):
+                    raw = raw[7:]
+                if raw:
+                    vscode_projects.append(raw)
+        except Exception:
+            pass  # Malformed JSON or permission error — treat as empty.
+
+    # --- Collect Claude projects from DB ---
+    since = int(time.time()) - days * 86_400
+    conn = init_db(db_path)
+    rows = conn.execute(
+        """SELECT DISTINCT project FROM sessions
+           WHERE started_at >= ? AND project != ''""",
+        (since,),
+    ).fetchall()
+    claude_projects = {r["project"] for r in rows}
+
+    # --- Find shared projects (path prefix matching) ---
+    shared: list[str] = []
+    for vp in vscode_projects:
+        for cp in claude_projects:
+            if vp == cp or vp.startswith(cp + "/") or cp.startswith(vp + "/"):
+                shared.append(vp)
+                break
+
+    return {
+        "vscode_installed": vscode_installed,
+        "vscode_projects": vscode_projects,
+        "shared_projects": shared,
+    }
